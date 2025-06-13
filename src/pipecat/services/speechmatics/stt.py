@@ -5,6 +5,8 @@
 #
 
 import asyncio
+import threading
+import time
 from typing import AsyncGenerator, Dict, Optional
 
 from loguru import logger
@@ -41,31 +43,57 @@ class AudioProcessor:
     def __init__(self):
         self.wave_data = bytearray()
         self.read_offset = 0
-        self._lock = asyncio.Lock()
+        self._lock = threading.Lock()
+        self._closed = False
 
     def read(self, chunk_size):
         """Read audio data for streaming to Speechmatics (synchronous version)."""
-        while self.read_offset + chunk_size > len(self.wave_data):
-            # For synchronous processing, we need to return available data
-            if len(self.wave_data) > self.read_offset:
-                available_data = self.wave_data[self.read_offset:]
-                self.read_offset = len(self.wave_data)
-                return bytes(available_data)
-            return b''
-        
-        new_offset = self.read_offset + chunk_size
-        data = self.wave_data[self.read_offset:new_offset]
-        self.read_offset = new_offset
-        return bytes(data)
+        with self._lock:
+            if self._closed:
+                return b''
+                
+            # Wait for data to be available
+            while self.read_offset >= len(self.wave_data) and not self._closed:
+                # Release lock temporarily to allow writes
+                self._lock.release()
+                time.sleep(0.01)  # Small delay to prevent busy waiting
+                self._lock.acquire()
+                
+            if self._closed:
+                return b''
+                
+            available_size = len(self.wave_data) - self.read_offset
+            if available_size == 0:
+                return b''
+                
+            read_size = min(chunk_size, available_size)
+            data = self.wave_data[self.read_offset:self.read_offset + read_size]
+            self.read_offset += read_size
+            
+            # Clean up old data periodically to prevent memory growth
+            if self.read_offset > 32000:  # Clean up after 32KB
+                self.wave_data = self.wave_data[self.read_offset:]
+                self.read_offset = 0
+                
+            return bytes(data)
 
     def write_audio(self, data):
         """Write audio data to buffer."""
-        self.wave_data.extend(data)
+        with self._lock:
+            if not self._closed:
+                self.wave_data.extend(data)
+
+    def close(self):
+        """Close the audio processor."""
+        with self._lock:
+            self._closed = True
 
     def clear(self):
         """Clear the audio buffer."""
-        self.wave_data.clear()
-        self.read_offset = 0
+        with self._lock:
+            self.wave_data.clear()
+            self.read_offset = 0
+            self._closed = False
 
 
 class SpeechmaticsSTTService(STTService):
@@ -94,10 +122,10 @@ class SpeechmaticsSTTService(STTService):
         language: Language = Language.EN,
         base_url: str = "eu2.rt.speechmatics.com",
         enable_partials: bool = True,
-        max_delay: float = 5.0,
+        max_delay: float = 0.7,
         sample_rate: Optional[int] = None,
         chunk_size: int = 1024,
-        audio_encoding: str = "pcm_f32le",
+        audio_encoding: str = "pcm_s16le",
         transcription_config: Optional[TranscriptionConfig] = None,
         **kwargs,
     ):
@@ -176,11 +204,18 @@ class SpeechmaticsSTTService(STTService):
             audio: Raw audio bytes to process.
             
         Yields:
-            None - transcription results are handled via event callbacks.
+            Frame objects as they become available.
         """
+        if not self._connected:
+            await self._connect()
+            
         if self._connected and self._audio_processor:
             self._audio_processor.write_audio(audio)
-        yield None
+        
+        # This method needs to yield, but actual frames are pushed via event handlers
+        # We yield nothing here as frames are handled asynchronously
+        return
+        yield  # This line will never be reached, but satisfies the AsyncGenerator type
 
     async def _connect(self):
         """Establish connection to Speechmatics WebSocket API."""
@@ -210,6 +245,7 @@ class SpeechmaticsSTTService(STTService):
                     language=self._language.value,
                     enable_partials=self._enable_partials,
                     max_delay=self._max_delay,
+                    
                 )
 
             # Configure audio settings
@@ -252,13 +288,13 @@ class SpeechmaticsSTTService(STTService):
             
             self._connected = False
 
+            if self._audio_processor:
+                self._audio_processor.close()
+                self._audio_processor = None
+
             if self._connection_task:
                 await self.cancel_task(self._connection_task)
                 self._connection_task = None
-
-            if self._audio_processor:
-                self._audio_processor.clear()
-                self._audio_processor = None
 
             self._websocket_client = None
             self._connection_settings = None
@@ -296,7 +332,7 @@ class SpeechmaticsSTTService(STTService):
         await asyncio.sleep(1)  # Brief delay before reconnection
         await self._connect()
 
-    async def _on_partial_transcript(self, message: Dict):
+    def _on_partial_transcript(self, message: Dict):
         """Handle partial transcript events.
         
         Args:
@@ -305,20 +341,18 @@ class SpeechmaticsSTTService(STTService):
         try:
             transcript = message.get("metadata", {}).get("transcript", "")
             if transcript:
-                await self.stop_ttfb_metrics()
-                await self.push_frame(
-                    InterimTranscriptionFrame(
-                        transcript,
-                        "",
-                        time_now_iso8601(),
-                        self._language,
-                        result=message,
-                    )
-                )
+                # Schedule the async operations using the event loop
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        loop.create_task(self._handle_partial_transcript(transcript, message))
+                except RuntimeError:
+                    # Fallback if no event loop is running
+                    logger.warning("No event loop available for partial transcript")
         except Exception as e:
             logger.error(f"Error processing partial transcript: {e}")
 
-    async def _on_final_transcript(self, message: Dict):
+    def _on_final_transcript(self, message: Dict):
         """Handle final transcript events.
         
         Args:
@@ -327,20 +361,50 @@ class SpeechmaticsSTTService(STTService):
         try:
             transcript = message.get("metadata", {}).get("transcript", "")
             if transcript:
-                await self.stop_ttfb_metrics()
-                await self.push_frame(
-                    TranscriptionFrame(
-                        transcript,
-                        "",
-                        time_now_iso8601(),
-                        self._language,
-                        result=message,
-                    )
-                )
-                await self._handle_transcription(transcript, True, self._language)
-                await self.stop_processing_metrics()
+                # Schedule the async operations using the event loop
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        loop.create_task(self._handle_final_transcript(transcript, message))
+                except RuntimeError:
+                    # Fallback if no event loop is running
+                    logger.warning("No event loop available for final transcript")
         except Exception as e:
             logger.error(f"Error processing final transcript: {e}")
+
+    async def _handle_partial_transcript(self, transcript: str, message: Dict):
+        """Handle partial transcript asynchronously."""
+        try:
+            await self.stop_ttfb_metrics()
+            await self.push_frame(
+                InterimTranscriptionFrame(
+                    transcript,
+                    "",
+                    time_now_iso8601(),
+                    self._language,
+                    result=message,
+                )
+            )
+        except Exception as e:
+            logger.error(f"Error handling partial transcript: {e}")
+
+    async def _handle_final_transcript(self, transcript: str, message: Dict):
+        """Handle final transcript asynchronously."""
+        try:
+            await self.stop_ttfb_metrics()
+            await self.push_frame(
+                TranscriptionFrame(
+                    transcript,
+                    "",
+                    time_now_iso8601(),
+                    self._language,
+                    result=message,
+                )
+            )
+            await self._handle_transcription(transcript, True, self._language)
+            await self.stop_processing_metrics()
+        except Exception as e:
+            logger.error(f"Error handling final transcript: {e}")
 
     @traced_stt
     async def _handle_transcription(
