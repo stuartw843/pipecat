@@ -18,10 +18,12 @@ from dotenv import load_dotenv
 from loguru import logger
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.frames.frames import EndOfUtteranceFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.speechmatics.stt import SpeechmaticsSTTService
 from pipecat.services.deepgram.tts import DeepgramTTSService
 from pipecat.services.openai.llm import OpenAILLMService
@@ -54,10 +56,30 @@ transport_params = {
 }
 
 
+class EndOfUtteranceProcessor(FrameProcessor):
+    """Processor to handle end of utterance events from Speechmatics STT."""
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, EndOfUtteranceFrame):
+            logger.info(f"🔚 End of utterance detected - ready for AI response! Start: {frame.start_time}s, End: {frame.end_time}s")
+            # This is where your voice AI would process the complete utterance
+            # and generate a response
+
+        await self.push_frame(frame, direction)
+
+
 async def run_example(transport: BaseTransport, _: argparse.Namespace, handle_sigint: bool):
     logger.info(f"Starting bot with Speechmatics STT")
 
-    stt = SpeechmaticsSTTService(api_key=os.getenv("SPEECHMATICS_API_KEY"))
+    # Optimized Speechmatics STT with reduced latency settings and end of utterance detection
+    stt = SpeechmaticsSTTService(
+        api_key=os.getenv("SPEECHMATICS_API_KEY"),
+        chunk_size=256,  # Reduced from default 1024 for lower latency
+        enable_partials=True,  # Ensure partial results are enabled
+        end_of_utterance_silence_trigger=0.5,  # Enable end of utterance detection with 0.75s silence
+    )
 
     tts = DeepgramTTSService(api_key=os.getenv("DEEPGRAM_API_KEY"), voice="aura-2-andromeda-en")
 
@@ -73,10 +95,14 @@ async def run_example(transport: BaseTransport, _: argparse.Namespace, handle_si
     context = OpenAILLMContext(messages)
     context_aggregator = llm.create_context_aggregator(context)
 
+    # Create end of utterance processor to handle EOU events
+    eou_processor = EndOfUtteranceProcessor()
+
     pipeline = Pipeline(
         [
             transport.input(),  # Transport user input
             stt,  # Speechmatics STT
+            eou_processor,  # End of utterance processor
             context_aggregator.user(),  # User responses
             llm,  # LLM
             tts,  # TTS
@@ -99,7 +125,7 @@ async def run_example(transport: BaseTransport, _: argparse.Namespace, handle_si
     async def on_client_connected(transport, client):
         logger.info(f"Client connected")
         # Kick off the conversation.
-        messages.append({"role": "system", "content": "Please introduce yourself to the user."})
+        messages.append({"role": "system", "content": "Just say hi."})
         await task.queue_frames([context_aggregator.user().get_context_frame()])
 
     @transport.event_handler("on_client_disconnected")

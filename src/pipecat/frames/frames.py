@@ -262,6 +262,22 @@ class InterimTranscriptionFrame(TextFrame):
 
 
 @dataclass
+class EndOfUtteranceFrame(SystemFrame):
+    """A frame indicating the end of an utterance detected by STT services.
+    Emitted when a period of silence is detected after speech.
+    """
+
+    user_id: str
+    timestamp: str
+    start_time: Optional[float] = None
+    end_time: Optional[float] = None
+    result: Optional[Any] = None
+
+    def __str__(self):
+        return f"{self.name}(user: {self.user_id}, timestamp: {self.timestamp}, start_time: {self.start_time}, end_time: {self.end_time})"
+
+
+@dataclass
 class TranslationFrame(TextFrame):
     """A text frame with translated transcription data.
 

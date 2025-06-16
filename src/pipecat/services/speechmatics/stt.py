@@ -5,8 +5,6 @@
 #
 
 import asyncio
-import threading
-import time
 from typing import AsyncGenerator, Dict, Optional
 
 from loguru import logger
@@ -14,6 +12,7 @@ from loguru import logger
 from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
+    EndOfUtteranceFrame,
     Frame,
     InterimTranscriptionFrame,
     StartFrame,
@@ -29,7 +28,7 @@ from pipecat.utils.tracing.service_decorators import traced_stt
 
 try:
     import speechmatics
-    from speechmatics.models import ConnectionSettings, TranscriptionConfig, AudioSettings
+    from speechmatics.models import ConnectionSettings, TranscriptionConfig, AudioSettings, ConversationConfig
     from speechmatics.client import WebsocketClient
 except ModuleNotFoundError as e:
     logger.error(f"Exception: {e}")
@@ -37,62 +36,64 @@ except ModuleNotFoundError as e:
     raise Exception(f"Missing module: {e}")
 
 
-class AudioProcessor:
-    """Audio processor for handling audio data stream to Speechmatics."""
+class OptimizedAudioProcessor:
+    """Optimized audio processor for low-latency streaming while maintaining compatibility."""
     
     def __init__(self):
-        self.wave_data = bytearray()
-        self.read_offset = 0
-        self._lock = threading.Lock()
+        self._buffer = bytearray()
         self._closed = False
+        import threading
+        self._lock = threading.Lock()
 
     def read(self, chunk_size):
-        """Read audio data for streaming to Speechmatics (synchronous version)."""
-        with self._lock:
-            if self._closed:
-                return b''
-                
-            # Wait for data to be available
-            while self.read_offset >= len(self.wave_data) and not self._closed:
-                # Release lock temporarily to allow writes
-                self._lock.release()
-                time.sleep(0.01)  # Small delay to prevent busy waiting
-                self._lock.acquire()
-                
-            if self._closed:
-                return b''
-                
-            available_size = len(self.wave_data) - self.read_offset
-            if available_size == 0:
-                return b''
-                
-            read_size = min(chunk_size, available_size)
-            data = self.wave_data[self.read_offset:self.read_offset + read_size]
-            self.read_offset += read_size
+        """Read audio data, waiting briefly if needed for data availability."""
+        import time
+        
+        # Wait briefly for data to become available (but not too long to avoid blocking)
+        max_wait_time = 0.1  # 100ms max wait
+        start_time = time.time()
+        
+        while not self._closed and len(self._buffer) < chunk_size:
+            if time.time() - start_time > max_wait_time:
+                break
+            time.sleep(0.0005)  # Very short sleep for responsiveness
             
-            # Clean up old data periodically to prevent memory growth
-            if self.read_offset > 32000:  # Clean up after 32KB
-                self.wave_data = self.wave_data[self.read_offset:]
-                self.read_offset = 0
+        if self._closed:
+            return b''
+            
+        with self._lock:
+            if len(self._buffer) < chunk_size:
+                # Return whatever data we have
+                if len(self._buffer) > 0:
+                    data = bytes(self._buffer)
+                    self._buffer.clear()
+                    return data
+                return b''
                 
-            return bytes(data)
+            data = bytes(self._buffer[:chunk_size])
+            del self._buffer[:chunk_size]
+            
+            # Clean up old data periodically for memory efficiency
+            if len(self._buffer) > 8192:  # Clean up after 8KB
+                self._buffer = bytearray(self._buffer)
+                
+            return data
 
     def write_audio(self, data):
         """Write audio data to buffer."""
-        with self._lock:
-            if not self._closed:
-                self.wave_data.extend(data)
+        if not self._closed:
+            with self._lock:
+                self._buffer.extend(data)
 
     def close(self):
-        """Close the audio processor."""
+        """Close the processor."""
         with self._lock:
             self._closed = True
 
     def clear(self):
-        """Clear the audio buffer."""
+        """Clear the buffer."""
         with self._lock:
-            self.wave_data.clear()
-            self.read_offset = 0
+            self._buffer.clear()
             self._closed = False
 
 
@@ -109,8 +110,10 @@ class SpeechmaticsSTTService(STTService):
         enable_partials: Enable partial transcription results (default: True).
         max_delay: Maximum delay for transcription in seconds (default: 5).
         sample_rate: Audio sample rate in Hz (default: None, inferred from pipeline).
-        chunk_size: Audio chunk size for streaming (default: 1024).
+        chunk_size: Audio chunk size for streaming (default: 256).
         audio_encoding: Audio encoding format (default: "pcm_f32le").
+        end_of_utterance_silence_trigger: Silence duration in seconds to trigger end of utterance detection (default: None, disabled).
+        operating_point: Operating point for transcription accuracy vs. latency tradeoff (default: "enhanced").
         transcription_config: Custom transcription configuration.
         **kwargs: Additional arguments passed to STTService.
     """
@@ -120,12 +123,14 @@ class SpeechmaticsSTTService(STTService):
         *,
         api_key: str,
         language: Language = Language.EN,
-        base_url: str = "eu2.rt.speechmatics.com",
+        base_url: str = "preview.rt.speechmatics.com",
         enable_partials: bool = True,
-        max_delay: float = 0.7,
+        max_delay: float = 0.5,
         sample_rate: Optional[int] = None,
-        chunk_size: int = 1024,
+        chunk_size: int = 512,
         audio_encoding: str = "pcm_s16le",
+        end_of_utterance_silence_trigger: Optional[float] = None,
+        operating_point: str = "standard",
         transcription_config: Optional[TranscriptionConfig] = None,
         **kwargs,
     ):
@@ -138,6 +143,8 @@ class SpeechmaticsSTTService(STTService):
         self._max_delay = max_delay
         self._chunk_size = chunk_size
         self._audio_encoding = audio_encoding
+        self._end_of_utterance_silence_trigger = end_of_utterance_silence_trigger
+        self._operating_point = operating_point
         self._custom_config = transcription_config
 
         # Connection management
@@ -234,18 +241,26 @@ class SpeechmaticsSTTService(STTService):
             # Create WebSocket client
             self._websocket_client = WebsocketClient(self._connection_settings)
 
-            # Set up audio processor
-            self._audio_processor = AudioProcessor()
+            # Set up optimized audio processor for low-latency streaming
+            self._audio_processor = OptimizedAudioProcessor()
 
             # Configure transcription settings
             if self._custom_config:
                 transcription_config = self._custom_config
             else:
+                # Configure conversation config for end of utterance detection
+                conversation_config = None
+                if self._end_of_utterance_silence_trigger is not None:
+                    conversation_config = ConversationConfig(
+                        end_of_utterance_silence_trigger=self._end_of_utterance_silence_trigger
+                    )
+                
                 transcription_config = TranscriptionConfig(
                     language=self._language.value,
                     enable_partials=self._enable_partials,
                     max_delay=self._max_delay,
-                    
+                    operating_point=self._operating_point,
+                    conversation_config=conversation_config,
                 )
 
             # Configure audio settings
@@ -263,6 +278,12 @@ class SpeechmaticsSTTService(STTService):
             self._websocket_client.add_event_handler(
                 event_name=speechmatics.models.ServerMessageType.AddTranscript,
                 event_handler=self._on_final_transcript,
+            )
+
+            # Register end of utterance event handler
+            self._websocket_client.add_event_handler(
+                event_name=speechmatics.models.ServerMessageType.EndOfUtterance,
+                event_handler=self._on_end_of_utterance,
             )
 
             # Start connection in background task
@@ -301,6 +322,10 @@ class SpeechmaticsSTTService(STTService):
 
         except Exception as e:
             logger.error(f"Error during disconnect: {e}")
+
+    async def cleanup(self):
+        """Cleanup resources."""
+        await self._disconnect()
 
     async def _run_connection(self, transcription_config: TranscriptionConfig, audio_settings: AudioSettings):
         """Run the WebSocket connection with Speechmatics.
@@ -372,6 +397,24 @@ class SpeechmaticsSTTService(STTService):
         except Exception as e:
             logger.error(f"Error processing final transcript: {e}")
 
+    def _on_end_of_utterance(self, message: Dict):
+        """Handle end of utterance events.
+        
+        Args:
+            message: End of utterance message from Speechmatics.
+        """
+        try:
+            # Schedule the async operations using the event loop
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.create_task(self._handle_end_of_utterance(message))
+            except RuntimeError:
+                # Fallback if no event loop is running
+                logger.warning("No event loop available for end of utterance")
+        except Exception as e:
+            logger.error(f"Error processing end of utterance: {e}")
+
     async def _handle_partial_transcript(self, transcript: str, message: Dict):
         """Handle partial transcript asynchronously."""
         try:
@@ -405,6 +448,25 @@ class SpeechmaticsSTTService(STTService):
             await self.stop_processing_metrics()
         except Exception as e:
             logger.error(f"Error handling final transcript: {e}")
+
+    async def _handle_end_of_utterance(self, message: Dict):
+        """Handle end of utterance asynchronously."""
+        try:
+            metadata = message.get("metadata", {})
+            start_time = metadata.get("start_time")
+            end_time = metadata.get("end_time")
+            
+            await self.push_frame(
+                EndOfUtteranceFrame(
+                    user_id="",
+                    timestamp=time_now_iso8601(),
+                    start_time=start_time,
+                    end_time=end_time,
+                    result=message,
+                )
+            )
+        except Exception as e:
+            logger.error(f"Error handling end of utterance: {e}")
 
     @traced_stt
     async def _handle_transcription(
