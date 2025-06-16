@@ -5,6 +5,9 @@
 #
 
 import asyncio
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import AsyncGenerator, Dict, Optional
 
 from loguru import logger
@@ -36,65 +39,117 @@ except ModuleNotFoundError as e:
     raise Exception(f"Missing module: {e}")
 
 
-class OptimizedAudioProcessor:
-    """Optimized audio processor for low-latency streaming while maintaining compatibility."""
+class AudioProcessor:
+    """Audio processor for handling audio data stream to Speechmatics with async-optimized design."""
     
     def __init__(self):
-        self._buffer = bytearray()
+        self.wave_data = bytearray()
+        self.read_offset = 0
+        self._lock = asyncio.Lock()
         self._closed = False
-        import threading
-        self._lock = threading.Lock()
 
-    def read(self, chunk_size):
-        """Read audio data, waiting briefly if needed for data availability."""
-        import time
-        
-        # Wait briefly for data to become available (but not too long to avoid blocking)
-        max_wait_time = 0.1  # 100ms max wait
-        start_time = time.time()
-        
-        while not self._closed and len(self._buffer) < chunk_size:
-            if time.time() - start_time > max_wait_time:
-                break
-            time.sleep(0.0005)  # Very short sleep for responsiveness
+    async def read(self, chunk_size):
+        """Read audio data for streaming to Speechmatics (async version with minimal latency)."""
+        # High-efficiency async approach with minimal sleep time
+        while not self._closed and self.read_offset + chunk_size > len(self.wave_data):
+            await asyncio.sleep(0.001)  # Much shorter sleep for lower latency
             
         if self._closed:
             return b''
             
-        with self._lock:
-            if len(self._buffer) < chunk_size:
-                # Return whatever data we have
-                if len(self._buffer) > 0:
-                    data = bytes(self._buffer)
-                    self._buffer.clear()
-                    return data
+        async with self._lock:
+            if self.read_offset + chunk_size > len(self.wave_data):
                 return b''
                 
-            data = bytes(self._buffer[:chunk_size])
-            del self._buffer[:chunk_size]
+            new_offset = self.read_offset + chunk_size
+            data = self.wave_data[self.read_offset:new_offset]
+            self.read_offset = new_offset
             
-            # Clean up old data periodically for memory efficiency
-            if len(self._buffer) > 8192:  # Clean up after 8KB
-                self._buffer = bytearray(self._buffer)
+            # Clean up old data more aggressively to prevent memory growth
+            if self.read_offset > 4096:  # Clean up after 4KB for better memory management
+                self.wave_data = self.wave_data[self.read_offset:]
+                self.read_offset = 0
                 
-            return data
+            return bytes(data)
 
-    def write_audio(self, data):
-        """Write audio data to buffer."""
+    async def write_audio(self, data):
+        """Write audio data to buffer (async version)."""
         if not self._closed:
-            with self._lock:
-                self._buffer.extend(data)
+            async with self._lock:
+                self.wave_data.extend(data)
 
-    def close(self):
-        """Close the processor."""
-        with self._lock:
+    def write_audio_sync(self, data):
+        """Synchronous write for compatibility."""
+        if not self._closed:
+            # Use asyncio.create_task if event loop is running
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self.write_audio(data))
+            except RuntimeError:
+                # Fallback for when no event loop is running
+                self.wave_data.extend(data)
+
+    async def close(self):
+        """Close the audio processor."""
+        async with self._lock:
             self._closed = True
 
-    def clear(self):
-        """Clear the buffer."""
-        with self._lock:
-            self._buffer.clear()
+    async def clear(self):
+        """Clear the audio buffer."""
+        async with self._lock:
+            self.wave_data.clear()
+            self.read_offset = 0
             self._closed = False
+
+
+class AsyncAudioProcessorWrapper:
+    """Wrapper to provide sync interface for speechmatics client while using async processor internally."""
+    
+    def __init__(self, async_processor):
+        self.async_processor = async_processor
+        self._loop = None
+
+    def read(self, chunk_size):
+        """Synchronous read that bridges to async processor."""
+        try:
+            # Try to get the current event loop
+            loop = asyncio.get_running_loop()
+            # Create a new task and run it
+            task = loop.create_task(self.async_processor.read(chunk_size))
+            # This is a bit tricky - we need to block until the task completes
+            # We'll use a simple approach with a small timeout loop
+            import time
+            start_time = time.time()
+            while not task.done() and time.time() - start_time < 0.1:
+                time.sleep(0.001)
+            
+            if task.done():
+                return task.result()
+            else:
+                return b''
+        except RuntimeError:
+            # No event loop running, fall back to blocking approach
+            return asyncio.run(self.async_processor.read(chunk_size))
+
+    def write_audio(self, data):
+        """Synchronous write that bridges to async processor."""
+        self.async_processor.write_audio_sync(data)
+
+    def close(self):
+        """Synchronous close."""
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self.async_processor.close())
+        except RuntimeError:
+            asyncio.run(self.async_processor.close())
+
+    def clear(self):
+        """Synchronous clear."""
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self.async_processor.clear())
+        except RuntimeError:
+            asyncio.run(self.async_processor.clear())
 
 
 class SpeechmaticsSTTService(STTService):
@@ -125,12 +180,12 @@ class SpeechmaticsSTTService(STTService):
         language: Language = Language.EN,
         base_url: str = "preview.rt.speechmatics.com",
         enable_partials: bool = True,
-        max_delay: float = 0.5,
+        max_delay: float = 1.5,
         sample_rate: Optional[int] = None,
-        chunk_size: int = 512,
+        chunk_size: int = 256,
         audio_encoding: str = "pcm_s16le",
         end_of_utterance_silence_trigger: Optional[float] = None,
-        operating_point: str = "standard",
+        operating_point: str = "enhanced",
         transcription_config: Optional[TranscriptionConfig] = None,
         **kwargs,
     ):
@@ -153,6 +208,9 @@ class SpeechmaticsSTTService(STTService):
         self._audio_processor = None
         self._connected = False
         self._connection_task = None
+        
+        # Dedicated thread executor for reduced overhead
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="speechmatics-stt")
 
         # Set model name for metrics
         self.set_model_name("speechmatics")
@@ -241,8 +299,9 @@ class SpeechmaticsSTTService(STTService):
             # Create WebSocket client
             self._websocket_client = WebsocketClient(self._connection_settings)
 
-            # Set up optimized audio processor for low-latency streaming
-            self._audio_processor = OptimizedAudioProcessor()
+            # Set up async audio processor with sync wrapper for speechmatics client
+            async_processor = AudioProcessor()
+            self._audio_processor = AsyncAudioProcessorWrapper(async_processor)
 
             # Configure transcription settings
             if self._custom_config:
@@ -324,8 +383,10 @@ class SpeechmaticsSTTService(STTService):
             logger.error(f"Error during disconnect: {e}")
 
     async def cleanup(self):
-        """Cleanup resources."""
+        """Cleanup resources including the thread executor."""
         await self._disconnect()
+        if hasattr(self, '_executor') and self._executor:
+            self._executor.shutdown(wait=True)
 
     async def _run_connection(self, transcription_config: TranscriptionConfig, audio_settings: AudioSettings):
         """Run the WebSocket connection with Speechmatics.
