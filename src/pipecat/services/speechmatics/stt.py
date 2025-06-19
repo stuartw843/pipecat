@@ -156,7 +156,8 @@ class SpeechmaticsSTTService(STTService):
     """Speechmatics STT service implementation.
     
     This service provides real-time speech-to-text transcription using the Speechmatics API.
-    It supports partial and final transcriptions, multiple languages, and various audio formats.
+    It supports partial and final transcriptions, multiple languages, various audio formats,
+    and speaker diarization.
     
     Args:
         api_key: Speechmatics API key for authentication.
@@ -169,6 +170,8 @@ class SpeechmaticsSTTService(STTService):
         audio_encoding: Audio encoding format (default: "pcm_f32le").
         end_of_utterance_silence_trigger: Silence duration in seconds to trigger end of utterance detection (default: None, disabled).
         operating_point: Operating point for transcription accuracy vs. latency tradeoff (default: "enhanced").
+        enable_speaker_diarization: Enable speaker diarization to identify different speakers (default: False).
+        max_speakers: Maximum number of speakers to detect (default: None, auto-detect).
         transcription_config: Custom transcription configuration.
         **kwargs: Additional arguments passed to STTService.
     """
@@ -186,6 +189,8 @@ class SpeechmaticsSTTService(STTService):
         audio_encoding: str = "pcm_s16le",
         end_of_utterance_silence_trigger: Optional[float] = None,
         operating_point: str = "enhanced",
+        enable_speaker_diarization: bool = False,
+        max_speakers: Optional[int] = None,
         transcription_config: Optional[TranscriptionConfig] = None,
         **kwargs,
     ):
@@ -200,6 +205,8 @@ class SpeechmaticsSTTService(STTService):
         self._audio_encoding = audio_encoding
         self._end_of_utterance_silence_trigger = end_of_utterance_silence_trigger
         self._operating_point = operating_point
+        self._enable_speaker_diarization = enable_speaker_diarization
+        self._max_speakers = max_speakers
         self._custom_config = transcription_config
 
         # Connection management
@@ -314,13 +321,24 @@ class SpeechmaticsSTTService(STTService):
                         end_of_utterance_silence_trigger=self._end_of_utterance_silence_trigger
                     )
                 
-                transcription_config = TranscriptionConfig(
-                    language=self._language.value,
-                    enable_partials=self._enable_partials,
-                    max_delay=self._max_delay,
-                    operating_point=self._operating_point,
-                    conversation_config=conversation_config,
-                )
+                # Configure transcription settings
+                config_dict = {
+                    "language": self._language.value,
+                    "enable_partials": self._enable_partials,
+                    "max_delay": self._max_delay,
+                    "operating_point": self._operating_point,
+                }
+                
+                if conversation_config is not None:
+                    config_dict["conversation_config"] = conversation_config
+                
+                # Configure speaker diarization if enabled
+                if self._enable_speaker_diarization:
+                    config_dict["diarization"] = "speaker"
+                    if self._max_speakers is not None:
+                        config_dict["speaker_diarization_max_speakers"] = self._max_speakers
+                
+                transcription_config = TranscriptionConfig(**config_dict)
 
             # Configure audio settings
             audio_settings = AudioSettings()
@@ -476,14 +494,59 @@ class SpeechmaticsSTTService(STTService):
         except Exception as e:
             logger.error(f"Error processing end of utterance: {e}")
 
+    def _extract_speaker_info(self, message: Dict) -> str:
+        """Extract speaker information from Speechmatics message.
+        
+        Args:
+            message: Speechmatics message containing potential speaker info.
+            
+        Returns:
+            Speaker identifier string (e.g., "S1", "S2"), or empty string if no speaker info.
+        """
+        try:
+            # Speechmatics returns speaker information in the message metadata
+            metadata = message.get("metadata", {})
+            
+            # Check for speaker information - Speechmatics uses "S1", "S2", etc.
+            speaker = metadata.get("speaker")
+            if speaker is not None:
+                return str(speaker)
+            
+            # Alternative formats that might be used
+            speaker_id = metadata.get("speaker_id")
+            if speaker_id is not None:
+                return str(speaker_id)
+                
+            # Check if there's speaker info in results array
+            results = message.get("results", [])
+            if results and len(results) > 0:
+                result = results[0]
+                alternatives = result.get("alternatives", [])
+                if alternatives and len(alternatives) > 0:
+                    alternative = alternatives[0]
+                    speaker = alternative.get("speaker")
+                    if speaker is not None:
+                        return str(speaker)
+            
+            return ""
+        except Exception as e:
+            logger.debug(f"Error extracting speaker info: {e}")
+            return ""
+
     async def _handle_partial_transcript(self, transcript: str, message: Dict):
         """Handle partial transcript asynchronously."""
         try:
             await self.stop_ttfb_metrics()
+            
+            # Extract speaker information if available
+            user_id = ""
+            if self._enable_speaker_diarization:
+                user_id = self._extract_speaker_info(message)
+            
             await self.push_frame(
                 InterimTranscriptionFrame(
                     transcript,
-                    "",
+                    user_id,
                     time_now_iso8601(),
                     self._language,
                     result=message,
@@ -496,10 +559,18 @@ class SpeechmaticsSTTService(STTService):
         """Handle final transcript asynchronously."""
         try:
             await self.stop_ttfb_metrics()
+            
+            # Extract speaker information if available
+            user_id = ""
+            if self._enable_speaker_diarization:
+                user_id = self._extract_speaker_info(message)
+                if user_id:
+                    logger.debug(f"Speaker diarization: {user_id} said: {transcript}")
+            
             await self.push_frame(
                 TranscriptionFrame(
                     transcript,
-                    "",
+                    user_id,
                     time_now_iso8601(),
                     self._language,
                     result=message,

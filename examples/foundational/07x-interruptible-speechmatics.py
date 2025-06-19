@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 from loguru import logger
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import EndOfUtteranceFrame
+from pipecat.frames.frames import EndOfUtteranceFrame, TranscriptionFrame, InterimTranscriptionFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
@@ -26,6 +26,7 @@ from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.speechmatics.stt import SpeechmaticsSTTService
 from pipecat.services.deepgram.tts import DeepgramTTSService
+from pipecat.services.cartesia.tts import CartesiaHttpTTSService
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.network.fastapi_websocket import FastAPIWebsocketParams
@@ -70,20 +71,83 @@ class EndOfUtteranceProcessor(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+class SpeakerDiarizationProcessor(FrameProcessor):
+    """Processor to handle speaker diarization and modify transcription content for LLM context."""
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, (TranscriptionFrame, InterimTranscriptionFrame)):
+            # Check if speaker information is available
+            if frame.user_id:
+                # Speechmatics uses "S1", "S2", etc. or custom speaker names
+                speaker_label = frame.user_id
+                
+                # If it's the standard S1, S2 format, convert to more readable format
+                if speaker_label.startswith("S") and speaker_label[1:].isdigit():
+                    speaker_num = speaker_label[1:]  # Extract number from "S1" -> "1"
+                    speaker_label = f"Speaker {speaker_num}"
+                
+                # Modify the text to include speaker label for LLM context
+                original_text = frame.text
+                modified_text = f"{speaker_label}: {original_text}"
+                
+                logger.info(f"🎤 {speaker_label} said: {original_text}")
+                
+                # Create a new frame with the modified text
+                if isinstance(frame, TranscriptionFrame):
+                    new_frame = TranscriptionFrame(
+                        text=modified_text,
+                        user_id=frame.user_id,
+                        timestamp=frame.timestamp,
+                        language=frame.language,
+                        result=frame.result
+                    )
+                else:  # InterimTranscriptionFrame
+                    new_frame = InterimTranscriptionFrame(
+                        text=modified_text,
+                        user_id=frame.user_id,
+                        timestamp=frame.timestamp,
+                        language=frame.language,
+                        result=frame.result
+                    )
+                
+                # Copy metadata and other properties
+                new_frame.pts = frame.pts
+                new_frame.metadata = frame.metadata
+                new_frame.transport_source = frame.transport_source
+                new_frame.transport_destination = frame.transport_destination
+                
+                await self.push_frame(new_frame, direction)
+                return
+
+        await self.push_frame(frame, direction)
+
+
 async def run_example(transport: BaseTransport, _: argparse.Namespace, handle_sigint: bool):
     logger.info(f"Starting bot with Speechmatics STT")
 
-    # Optimized Speechmatics STT with reduced latency settings and end of utterance detection
+    # Optimized Speechmatics STT with reduced latency settings, end of utterance detection, and speaker diarization
     stt = SpeechmaticsSTTService(
         api_key=os.getenv("SPEECHMATICS_API_KEY"),
-        chunk_size=256,  # Reduced from default 1024 for lower latency
+        chunk_size=1024,  # Reduced from default 1024 for lower latency
         enable_partials=True,  # Ensure partial results are enabled
-        end_of_utterance_silence_trigger=0.5,  # Enable end of utterance detection with 0.75s silence
+        end_of_utterance_silence_trigger=0.5,  # Enable end of utterance detection with 0.5s silence
+        enable_speaker_diarization=True,  # Enable speaker diarization
+        max_speakers=4,  # Maximum number of speakers to detect (optional)
     )
 
-    tts = DeepgramTTSService(api_key=os.getenv("DEEPGRAM_API_KEY"), voice="aura-2-andromeda-en")
 
-    llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))
+    tts = CartesiaHttpTTSService(
+    api_key=os.getenv("CARTESIA_API_KEY"),
+    voice_id="bf0a246a-8642-498a-9950-80c35e9276b5",
+    model="sonic",
+    params=CartesiaHttpTTSService.InputParams(
+        language="en",
+    )
+    )
+
+    llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"),model="gpt-4o-mini")
 
     messages = [
         {
@@ -95,13 +159,15 @@ async def run_example(transport: BaseTransport, _: argparse.Namespace, handle_si
     context = OpenAILLMContext(messages)
     context_aggregator = llm.create_context_aggregator(context)
 
-    # Create end of utterance processor to handle EOU events
+    # Create processors
     eou_processor = EndOfUtteranceProcessor()
+    speaker_processor = SpeakerDiarizationProcessor()
 
     pipeline = Pipeline(
         [
             transport.input(),  # Transport user input
-            stt,  # Speechmatics STT
+            stt,  # Speechmatics STT with speaker diarization
+            speaker_processor,  # Speaker diarization processor (adds speaker labels to transcription)
             eou_processor,  # End of utterance processor
             context_aggregator.user(),  # User responses
             llm,  # LLM
